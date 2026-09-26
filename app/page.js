@@ -363,8 +363,8 @@ export default function Home() {
                   間隔 {intervalMs} ms
                   <input
                     type="range"
-                    min="1000"
-                    max="2000"
+                    min="500"
+                    max="1500"
                     step="100"
                     value={intervalMs}
                     disabled={running}

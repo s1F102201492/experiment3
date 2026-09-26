@@ -144,7 +144,7 @@ export async function POST(request) {
   const started = Date.now();
 
   const openaiResponse = await fetch(
-    "https://api.openai.com/v1/chat/completions",
+    "https://api.openai.iniad.org/api/v1/chat/completions",
     {
       method: "POST",
       headers: {
