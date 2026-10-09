@@ -150,6 +150,7 @@ export default function Home() {
             frame_count: frameCount,
             latency_ms: latencyMs,
             server_latency_ms: payload.server_latency_ms,
+            provider: payload.provider,
             model: payload.model,
             usage: payload.usage,
             cost_usd_estimate: payload.cost_usd_estimate,
@@ -289,6 +290,33 @@ export default function Home() {
     WAIT: "待つ",
   };
 
+  const pedestrianSignalLabel = {
+    steady: "点灯",
+    blinking: "点滅",
+    not_visible: "見えない",
+    unknown: "不明",
+  };
+
+  function formatStripeCount(count) {
+    if (count === null || count === undefined) return "不明";
+    return `約${count}本`;
+  }
+
+  function formatCountdown(result) {
+    if (!result?.pedestrian_countdown_meter_present) {
+      return "メーターなし";
+    }
+    const seconds = result.pedestrian_countdown_seconds_estimate;
+    const coarse = result.pedestrian_countdown_estimate;
+    if (seconds !== null && seconds !== undefined) {
+      return `約${seconds}秒（${coarse}）`;
+    }
+    if (coarse && coarse !== "不明") {
+      return `秒数不明（${coarse}）`;
+    }
+    return "メーターあり・残り不明";
+  }
+
   return (
     <div className="min-h-full bg-zinc-50 text-zinc-950 dark:bg-black dark:text-zinc-50">
       <main className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-6 sm:px-6">
@@ -298,9 +326,9 @@ export default function Home() {
             横断歩道ナビゲーション実験
           </h1>
           <p className="max-w-2xl text-sm leading-6 text-zinc-600 dark:text-zinc-400">
-            カメラまたは保存動画のフレームを GPT-4o Vision
-            で解析し、判定のたびに日本語で自動案内します。YOLO
-            は使いません。
+            カメラまたは保存動画のフレームを GPT-6 Luna または Gemini 3.8
+            Flash で解析し、判定のたびに日本語で自動案内します。プロバイダは
+            .env.local の LLM_PROVIDER で切り替えます。YOLO は使いません。
           </p>
         </header>
 
@@ -424,13 +452,29 @@ export default function Home() {
               <p>推奨: {actionLabel[lastResult.result.recommended_action]}</p>
               <p>信号: {lastResult.result.signal_state}</p>
               <p>
+                歩行者信号:{" "}
+                {pedestrianSignalLabel[lastResult.result.pedestrian_signal_display] ??
+                  lastResult.result.pedestrian_signal_display}
+              </p>
+              <p>残り時間メーター: {formatCountdown(lastResult.result)}</p>
+              <p>
                 横断歩道:{" "}
                 {lastResult.result.crosswalk_visible ? "あり" : "なし"}（
                 {lastResult.result.crosswalk_distance_estimate}）
               </p>
               <p>
+                横断歩道の帯:{" "}
+                {formatStripeCount(
+                  lastResult.result.crosswalk_stripe_count_estimate,
+                )}
+                ／範囲 {lastResult.result.crosswalk_stripe_extent}
+              </p>
+              <p>
                 危険: {lastResult.result.approaching_hazard}（
                 {lastResult.result.hazard_distance_estimate}）
+              </p>
+              <p>
+                モデル: {lastResult.provider ?? "—"} / {lastResult.model ?? "—"}
               </p>
               <p>レイテンシ: {lastResult.latencyMs} ms</p>
               <p>
@@ -473,7 +517,7 @@ export default function Home() {
             {logs.length === 0 ? (
               <p className="text-zinc-500">ログはまだありません。</p>
             ) : (
-              <table className="w-full min-w-[640px] border-collapse text-left">
+              <table className="w-full min-w-[1020px] border-collapse text-left">
                 <thead>
                   <tr className="border-b border-zinc-200 dark:border-zinc-800">
                     <th className="py-2 pr-3">時刻</th>
@@ -481,6 +525,9 @@ export default function Home() {
                     <th className="py-2 pr-3">モード</th>
                     <th className="py-2 pr-3">ms</th>
                     <th className="py-2 pr-3">信号</th>
+                    <th className="py-2 pr-3">歩行者信号</th>
+                    <th className="py-2 pr-3">残りメーター</th>
+                    <th className="py-2 pr-3">横断歩道の帯</th>
                     <th className="py-2 pr-3">案内</th>
                   </tr>
                 </thead>
@@ -498,6 +545,21 @@ export default function Home() {
                       <td className="py-2 pr-3">{log.latency_ms}</td>
                       <td className="py-2 pr-3">
                         {log.result?.signal_state || log.error || "—"}
+                      </td>
+                      <td className="py-2 pr-3">
+                        {log.result
+                          ? pedestrianSignalLabel[
+                              log.result.pedestrian_signal_display
+                            ] ?? log.result.pedestrian_signal_display
+                          : "—"}
+                      </td>
+                      <td className="py-2 pr-3">
+                        {log.result ? formatCountdown(log.result) : "—"}
+                      </td>
+                      <td className="py-2 pr-3">
+                        {log.result
+                          ? `${formatStripeCount(log.result.crosswalk_stripe_count_estimate)} / ${log.result.crosswalk_stripe_extent}`
+                          : "—"}
                       </td>
                       <td className="py-2 pr-3">
                         {log.result?.voice_message || log.error}

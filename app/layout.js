@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 export const metadata = {
   title: "横断歩道ナビゲーション実験",
   description:
-    "視覚障害者向け横断支援の実験システム（GPT-4o Vision + 音声案内）",
+    "視覚障害者向け横断支援の実験システム（GPT-6 Luna / Gemini 3.8 Flash + 音声案内）",
 };
 
 export default function RootLayout({ children }) {
