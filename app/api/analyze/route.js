@@ -1,5 +1,10 @@
+import {
+  sanitizeTimelineInput,
+  summarizeTimeline,
+} from "@/lib/signalTimeline";
+
 const SYSTEM_PROMPT = `あなたは視覚障害者の道路横断を支援するアシスタントです。
-提供された連続画像（直近の映像フレーム）を分析し、
+提供された画像（直近の映像フレーム）と、YOLO による「信号点灯タイムライン」を分析し、
 以下の項目をJSON形式で出力してください。
 
 {
@@ -20,14 +25,27 @@ const SYSTEM_PROMPT = `あなたは視覚障害者の道路横断を支援する
 
 ルール:
 - JSON以外は出力しない。
-- 複数枚ある場合は時系列（古い順→新しい順）として扱い、信号の点滅と接近物の変化を優先して判断する。
+- 複数枚ある場合は時系列（古い順→新しい順）として扱い、接近物の変化を優先して判断する。
 - pedestrian_signal_display は歩行者用信号機（青人形・赤人形など）の表示状態。点灯し続けているなら steady、点滅しているなら blinking。映像内に歩行者信号が写っていなければ not_visible。判定できなければ unknown。
+
+信号点灯タイムラインの扱い:
+- ユーザー入力に「信号点灯タイムライン」が含まれる場合、点滅の判定はこれを最優先の根拠とし、画像の見た目より優先する。
+- これは物体検出モデル（YOLO）が歩行者信号を interval_ms ごとに判定した結果で、配列は古い順→新しい順。1=点灯、0=消灯（灯器は見えるが光っていない）、null=信号を検出できなかった。
+- raw は検出そのままの配列、smoothed はカメラのちらつき（点灯に挟まれた0.2秒以下の短い消灯）を点灯に置き換えた配列。点滅の判断には smoothed を使い、raw にだけある短い0はちらつきなので点滅とみなさない。
+- verdict はプログラムによる判定結果:
+  - blinking: smoothed に0.3秒以上の消灯があり、その前後が点灯している（本当の点滅）。pedestrian_signal_display と signal_state を blinking にする。
+  - steady: 検出できたフレームがすべて点灯。点滅ではない。色は dominant_color（blue=青、red=赤）と画像から判断する。
+  - off: ほとんど消灯している。点滅の消灯中や信号の切り替わり中の可能性があるため、安全側に倒す。
+  - unknown: 検出が少ない、または判断できない。画像だけで判断するが、点滅かどうか分からない場合は渡らせない。
+- detected_ratio は信号を検出できたフレームの割合。0.5未満なら信頼性が低い。
+- dominant_color は点灯していたフレームの色。画像と明らかに矛盾する場合は画像を優先し、判断できなければ unknown にする。
+- 歩行者信号が点滅している、または点滅の可能性がある場合は、これから横断を始めるべきではないため recommended_action を GO にしない。
+- タイムラインが無い場合は画像だけで判断し、1枚だけなら点滅は判定しない（unknown を優先）。
 - pedestrian_countdown_meter_present は歩行者信号機に「あとどれくらいで信号が変わるか」を示す表示（数字カウントダウン、残り秒、プログレスバー、メーターなど）があるか。
 - pedestrian_countdown_seconds_estimate はメーターがあり数字が読める場合の、信号切り替えまでの残り秒数の目安（整数）。読めない場合は null。メーターが無い場合も null。
 - pedestrian_countdown_estimate はメーターはあるが秒数が読めない場合の、残り時間の粗い目安（短い=まもなく切り替わる、長い=まだ余裕）。メーターが無い、または全く推定できない場合は「不明」。秒数が読めた場合も、参考として短い/中程度/長いを付けてよい（0-10秒=短い、11-30秒=中程度、31秒以上=長い の目安）。
 - crosswalk_stripe_count_estimate は横断歩道の白い縞（帯）の本数の目安（整数）。一部しか見えない場合は見えている範囲で推定し、全く数えられない場合は null。
 - crosswalk_stripe_extent は横断歩道の縞模様が画面内でどれだけ続いて見えるか（横断方向の長さの目安）。
-- 1枚だけの場合、点滅はほぼ判定できないため signal_state は red / green / unknown を優先し、pedestrian_signal_display も unknown になりやすい。複数枚で明滅が確認できたときだけ blinking とする。
 - 距離はメートルではなく「近い」「中程度」「遠い」「不明」のみ。
 - approaching_hazard はユーザーに最も危険な対象を1つ選ぶ。危険がなければ none。
 - recommended_action は安全側に倒す。渡ってよいか不明なら WAIT または STOP。
@@ -254,8 +272,29 @@ function estimateCostUsd(usage, inputUsdPerMillion, outputUsdPerMillion) {
   return Number((input + output).toFixed(6));
 }
 
-function buildOpenAIRequestBody(config, images) {
-  const userText = `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`;
+function buildUserText(images, timeline) {
+  const base = `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`;
+  if (!timeline) return `${base}\n信号点灯タイムライン: なし`;
+  return `${base}\n信号点灯タイムライン(JSON):\n${JSON.stringify(timeline)}`;
+}
+
+function applyTimelineSafety(result, timeline) {
+  if (timeline?.verdict !== "blinking") return result;
+  const adjusted = {
+    ...result,
+    signal_state: "blinking",
+    pedestrian_signal_display: "blinking",
+  };
+  if (adjusted.recommended_action === "GO") {
+    adjusted.recommended_action = "WAIT";
+    adjusted.voice_message =
+      "歩行者信号が点滅しています。渡らずに次の青信号を待ってください。";
+  }
+  return adjusted;
+}
+
+function buildOpenAIRequestBody(config, images, timeline) {
+  const userText = buildUserText(images, timeline);
 
   if (config.api === "chat") {
     const body = {
@@ -313,8 +352,8 @@ function buildOpenAIRequestBody(config, images) {
   return body;
 }
 
-function buildGeminiRequestBody(config, images) {
-  const userText = `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`;
+function buildGeminiRequestBody(config, images, timeline) {
+  const userText = buildUserText(images, timeline);
   const imageParts = images.map((url) => {
     const parsed = parseDataUrl(url);
     if (!parsed) {
@@ -381,11 +420,11 @@ function extractProviderError(payload, provider) {
   return payload?.error?.message || null;
 }
 
-async function callVisionProvider(config, images) {
+async function callVisionProvider(config, images, timeline) {
   const isGemini = config.provider === "gemini";
   const requestBody = isGemini
-    ? buildGeminiRequestBody(config, images)
-    : buildOpenAIRequestBody(config, images);
+    ? buildGeminiRequestBody(config, images, timeline)
+    : buildOpenAIRequestBody(config, images, timeline);
 
   const headers = {
     "Content-Type": "application/json",
@@ -444,10 +483,13 @@ export async function POST(request) {
     );
   }
 
+  const timelineInput = sanitizeTimelineInput(body?.signal_timeline);
+  const timeline = timelineInput ? summarizeTimeline(timelineInput) : null;
+
   const started = Date.now();
   let providerResponse;
   try {
-    providerResponse = await callVisionProvider(config, images);
+    providerResponse = await callVisionProvider(config, images, timeline);
   } catch (caught) {
     const message =
       caught instanceof Error ? caught.message : "API 呼び出しに失敗しました。";
@@ -472,13 +514,17 @@ export async function POST(request) {
   const text = isGemini
     ? extractGeminiResponseText(payload)
     : extractOpenAIResponseText(payload, config.api);
-  const result = normalizeResult(parseModelJson(text));
+  const result = applyTimelineSafety(
+    normalizeResult(parseModelJson(text)),
+    timeline,
+  );
   const usage = normalizeUsage(
     isGemini ? payload?.usageMetadata : payload?.usage,
   );
 
   return Response.json({
     result,
+    signal_timeline: timeline,
     usage,
     provider: config.provider,
     model: config.model,
