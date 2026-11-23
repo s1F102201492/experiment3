@@ -1,3 +1,4 @@
+import { formatShutter, sanitizeExposureInfo } from "@/lib/cameraExposure";
 import {
   sanitizeTimelineInput,
   summarizeTimeline,
@@ -30,17 +31,19 @@ const SYSTEM_PROMPT = `あなたは視覚障害者の道路横断を支援する
 
 信号点灯タイムラインの扱い:
 - ユーザー入力に「信号点灯タイムライン」が含まれる場合、点滅の判定はこれを最優先の根拠とし、画像の見た目より優先する。
-- これは物体検出モデル（YOLO）が歩行者信号を interval_ms ごとに判定した結果で、配列は古い順→新しい順。1=点灯、0=消灯（灯器は見えるが光っていない）、null=信号を検出できなかった。
-- raw は検出そのままの配列、smoothed はカメラのちらつき（点灯に挟まれた0.2秒以下の短い消灯）を点灯に置き換えた配列。点滅の判断には smoothed を使い、raw にだけある短い0はちらつきなので点滅とみなさない。
+- raw は歩行者信号を interval_ms ごとに判定した結果で、配列は古い順→新しい順。1=点灯、0=消灯（灯器は見えるが光っていない）、null=信号を検出できなかった、または判定できなかった。
+- 各フレームは、物体検出モデル（YOLO）の確信度が高いときはそのクラスで、低いときは信号機の上半分（赤）と下半分（青）のどちらが明るいかで判定している。
+- カメラのちらつきは露光時間の設定で抑えている。1〜2要素だけの0は点滅とみなさない。
 - verdict はプログラムによる判定結果:
-  - blinking: smoothed に0.3秒以上の消灯があり、その前後が点灯している（本当の点滅）。pedestrian_signal_display と signal_state を blinking にする。
-  - steady: 検出できたフレームがすべて点灯。点滅ではない。色は dominant_color（blue=青、red=赤）と画像から判断する。
+  - blinking: raw に0.3秒以上の消灯があり、その前後が点灯している（本当の点滅）。pedestrian_signal_display と signal_state を blinking にする。
+  - steady: 検出できたフレームのほぼすべて（85%以上）が点灯。点滅ではない。色は dominant_color（blue=青、red=赤）と画像から判断する。
   - off: ほとんど消灯している。点滅の消灯中や信号の切り替わり中の可能性があるため、安全側に倒す。
   - unknown: 検出が少ない、または判断できない。画像だけで判断するが、点滅かどうか分からない場合は渡らせない。
 - detected_ratio は信号を検出できたフレームの割合。0.5未満なら信頼性が低い。
 - dominant_color は点灯していたフレームの色。画像と明らかに矛盾する場合は画像を優先し、判断できなければ unknown にする。
 - 歩行者信号が点滅している、または点滅の可能性がある場合は、これから横断を始めるべきではないため recommended_action を GO にしない。
 - タイムラインが無い場合は画像だけで判断し、1枚だけなら点滅は判定しない（unknown を優先）。
+- 「カメラ露光」が示されている場合、シャッタースピードを短くしているため画像全体が暗く、色が薄く写ることがある。暗さや色の薄さだけを理由に信号を消灯と判断しない。
 - pedestrian_countdown_meter_present は歩行者信号機に「あとどれくらいで信号が変わるか」を示す表示（数字カウントダウン、残り秒、プログレスバー、メーターなど）があるか。
 - pedestrian_countdown_seconds_estimate はメーターがあり数字が読める場合の、信号切り替えまでの残り秒数の目安（整数）。読めない場合は null。メーターが無い場合も null。
 - pedestrian_countdown_estimate はメーターはあるが秒数が読めない場合の、残り時間の粗い目安（短い=まもなく切り替わる、長い=まだ余裕）。メーターが無い、または全く推定できない場合は「不明」。秒数が読めた場合も、参考として短い/中程度/長いを付けてよい（0-10秒=短い、11-30秒=中程度、31秒以上=長い の目安）。
@@ -272,10 +275,21 @@ function estimateCostUsd(usage, inputUsdPerMillion, outputUsdPerMillion) {
   return Number((input + output).toFixed(6));
 }
 
-function buildUserText(images, timeline) {
-  const base = `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`;
-  if (!timeline) return `${base}\n信号点灯タイムライン: なし`;
-  return `${base}\n信号点灯タイムライン(JSON):\n${JSON.stringify(timeline)}`;
+function buildUserText(images, timeline, exposure) {
+  const lines = [
+    `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`,
+  ];
+  if (exposure && exposure.mode !== "device") {
+    lines.push(
+      `カメラ露光: シャッタースピード ${formatShutter(exposure.shutter)}、ISO ${exposure.iso ?? "不明"}`,
+    );
+  }
+  lines.push(
+    timeline
+      ? `信号点灯タイムライン(JSON):\n${JSON.stringify(timeline)}`
+      : "信号点灯タイムライン: なし",
+  );
+  return lines.join("\n");
 }
 
 function applyTimelineSafety(result, timeline) {
@@ -293,8 +307,8 @@ function applyTimelineSafety(result, timeline) {
   return adjusted;
 }
 
-function buildOpenAIRequestBody(config, images, timeline) {
-  const userText = buildUserText(images, timeline);
+function buildOpenAIRequestBody(config, images, timeline, exposure) {
+  const userText = buildUserText(images, timeline, exposure);
 
   if (config.api === "chat") {
     const body = {
@@ -352,8 +366,8 @@ function buildOpenAIRequestBody(config, images, timeline) {
   return body;
 }
 
-function buildGeminiRequestBody(config, images, timeline) {
-  const userText = buildUserText(images, timeline);
+function buildGeminiRequestBody(config, images, timeline, exposure) {
+  const userText = buildUserText(images, timeline, exposure);
   const imageParts = images.map((url) => {
     const parsed = parseDataUrl(url);
     if (!parsed) {
@@ -420,11 +434,11 @@ function extractProviderError(payload, provider) {
   return payload?.error?.message || null;
 }
 
-async function callVisionProvider(config, images, timeline) {
+async function callVisionProvider(config, images, timeline, exposure) {
   const isGemini = config.provider === "gemini";
   const requestBody = isGemini
-    ? buildGeminiRequestBody(config, images, timeline)
-    : buildOpenAIRequestBody(config, images, timeline);
+    ? buildGeminiRequestBody(config, images, timeline, exposure)
+    : buildOpenAIRequestBody(config, images, timeline, exposure);
 
   const headers = {
     "Content-Type": "application/json",
@@ -485,11 +499,17 @@ export async function POST(request) {
 
   const timelineInput = sanitizeTimelineInput(body?.signal_timeline);
   const timeline = timelineInput ? summarizeTimeline(timelineInput) : null;
+  const exposure = sanitizeExposureInfo(body?.camera_exposure);
 
   const started = Date.now();
   let providerResponse;
   try {
-    providerResponse = await callVisionProvider(config, images, timeline);
+    providerResponse = await callVisionProvider(
+      config,
+      images,
+      timeline,
+      exposure,
+    );
   } catch (caught) {
     const message =
       caught instanceof Error ? caught.message : "API 呼び出しに失敗しました。";
@@ -525,6 +545,7 @@ export async function POST(request) {
   return Response.json({
     result,
     signal_timeline: timeline,
+    camera_exposure: exposure,
     usage,
     provider: config.provider,
     model: config.model,
