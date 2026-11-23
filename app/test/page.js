@@ -12,6 +12,7 @@ import {
   readExposureSupport,
 } from "@/lib/cameraExposure";
 import { combineSignalJudgement, measureLamps } from "@/lib/lampPosition";
+import { LLM_PROVIDERS, useLlmProvider } from "@/lib/llmProvider";
 import { createSignalDetector, MODEL_URL } from "@/lib/signalDetector";
 import {
   FRAME_INTERVAL_MS,
@@ -205,6 +206,7 @@ export default function TestPage() {
     steps: [],
     message: "",
   });
+  const { provider, providerRef, setProvider, available } = useLlmProvider();
 
   const updateAppliedExposure = useCallback((value) => {
     appliedExposureRef.current = value;
@@ -351,6 +353,7 @@ export default function TestPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          provider: providerRef.current,
           images,
           signal_timeline: timelineInput,
           camera_exposure: cameraExposure,
@@ -407,7 +410,7 @@ export default function TestPage() {
       analyzingRef.current = false;
       setAnalyzing(false);
     }
-  }, [announce, captureFrame, source, videoName]);
+  }, [announce, captureFrame, providerRef, source, videoName]);
 
   const startCamera = useCallback(async () => {
     stopCamera();
@@ -597,8 +600,8 @@ export default function TestPage() {
             カメラの露光時間と ISO を調整してちらつきと白飛びを抑え、0.1秒ごとに
             YOLO26n（ブラウザ内）と信号機の上下の明るさで歩行者信号の点灯・消灯を判定します。
             直近2秒分の結果と最新フレームを GPT-6 Luna または Gemini 3.8 Flash
-            に渡して、1秒ごとに日本語で案内します。プロバイダは .env.local の
-            LLM_PROVIDER で切り替えます。
+            に渡して、1秒ごとに日本語で案内します。プロバイダは下の「AI モデル」で切り替えます（未選択なら
+            .env.local の LLM_PROVIDER）。
           </p>
         </header>
 
@@ -642,6 +645,31 @@ export default function TestPage() {
               {videoName ? (
                 <p className="text-xs text-zinc-500">{videoName}</p>
               ) : null}
+            </fieldset>
+
+            <fieldset className="flex flex-col gap-2">
+              <legend className="text-sm font-medium">AI モデル</legend>
+              <div className="flex flex-wrap gap-2">
+                {LLM_PROVIDERS.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    aria-pressed={provider === item.id}
+                    className={`rounded-full px-4 py-2 text-sm ${
+                      provider === item.id
+                        ? "bg-zinc-950 text-white dark:bg-white dark:text-black"
+                        : "border border-zinc-300 dark:border-zinc-700"
+                    }`}
+                    onClick={() => setProvider(item.id)}
+                  >
+                    {item.label}
+                    {available && !available[item.id] ? "（キー未設定）" : ""}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-zinc-500">
+                実行中に切り替えると次の解析から反映されます。ここでの選択はホームの案内にも使われます。
+              </p>
             </fieldset>
 
             <div className="flex flex-col gap-1 text-sm">

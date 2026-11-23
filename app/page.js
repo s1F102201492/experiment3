@@ -8,6 +8,7 @@ import {
   readExposureSupport,
 } from "@/lib/cameraExposure";
 import { combineSignalJudgement, measureLamps } from "@/lib/lampPosition";
+import { useLlmProvider } from "@/lib/llmProvider";
 import { createSignalDetector } from "@/lib/signalDetector";
 import { FRAME_INTERVAL_MS, WINDOW_FRAMES } from "@/lib/signalTimeline";
 
@@ -73,6 +74,7 @@ export default function Home() {
   const [status, setStatus] = useState("idle");
   const [message, setMessage] = useState("");
   const [action, setAction] = useState(null);
+  const { providerRef } = useLlmProvider();
 
   const updateStatus = useCallback((value) => {
     statusRef.current = value;
@@ -165,6 +167,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          provider: providerRef.current,
           images: [captureFrame()],
           signal_timeline: buildTimelineInput(framesRef.current),
           camera_exposure: exposureRef.current,
@@ -189,7 +192,7 @@ export default function Home() {
     } finally {
       analyzingRef.current = false;
     }
-  }, [announce, captureFrame]);
+  }, [announce, captureFrame, providerRef]);
 
   const startGuide = useCallback(async () => {
     updateStatus("preparing");
@@ -263,7 +266,6 @@ export default function Home() {
     vibrate(300);
     speakJapanese("案内を停止しました。");
   }, [startGuide, stopGuide]);
-
   const buttonLabel =
     status === "idle"
       ? "案内開始"
