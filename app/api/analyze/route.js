@@ -67,8 +67,17 @@ const DISTANCES = new Set(["近い", "中程度", "遠い", "不明"]);
 const HAZARDS = new Set(["vehicle", "bicycle", "person", "none"]);
 const ACTIONS = new Set(["GO", "STOP", "WAIT"]);
 
-function getConfig() {
+const PROVIDERS = new Set(["openai", "gemini"]);
+
+function defaultProvider() {
   const provider = (process.env.LLM_PROVIDER || "openai").toLowerCase();
+  return PROVIDERS.has(provider) ? provider : "openai";
+}
+
+function getConfig(requestedProvider) {
+  const provider = PROVIDERS.has(requestedProvider)
+    ? requestedProvider
+    : defaultProvider();
 
   if (provider === "gemini") {
     const baseUrl = (
@@ -463,8 +472,25 @@ async function callVisionProvider(config, images, timeline, exposure) {
 
 export const maxDuration = 60;
 
+export async function GET() {
+  return Response.json({
+    default_provider: defaultProvider(),
+    available: {
+      openai: Boolean(process.env.OPENAI_API_KEY),
+      gemini: Boolean(process.env.GEMINI_API_KEY),
+    },
+  });
+}
+
 export async function POST(request) {
-  const config = getConfig();
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "JSON を解析できません。" }, { status: 400 });
+  }
+
+  const config = getConfig(body?.provider);
 
   if (!config.apiKey) {
     return Response.json(
@@ -473,13 +499,6 @@ export async function POST(request) {
       },
       { status: 500 },
     );
-  }
-
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: "JSON を解析できません。" }, { status: 400 });
   }
 
   const images = Array.isArray(body?.images) ? body.images.slice(0, 5) : [];
