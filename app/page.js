@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   applyDeviceExposure,
@@ -32,6 +31,10 @@ function speakJapanese(text) {
   if (voice) utterance.voice = voice;
   window.speechSynthesis.speak(utterance);
 }
+
+const VIBRATE_START = [200, 150, 200];
+const VIBRATE_STOP = [200, 150, 200, 150, 200];
+const VIBRATE_ERROR = 800;
 
 function vibrate(pattern) {
   navigator.vibrate?.(pattern);
@@ -197,8 +200,9 @@ export default function Home() {
   const startGuide = useCallback(async () => {
     updateStatus("preparing");
     setMessage("準備しています。そのままお待ちください。");
-    vibrate(100);
-    speakJapanese("準備しています。カメラを前に向けて、そのままお待ちください。");
+    speakJapanese(
+      "準備しています。案内が始まると2回、終わると3回、振動でお知らせします。カメラを前に向けて、そのままお待ちください。",
+    );
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -238,7 +242,7 @@ export default function Home() {
       if (statusRef.current !== "preparing") return;
       stopGuide();
       setMessage("カメラを起動できませんでした。");
-      vibrate([200, 100, 200]);
+      vibrate(VIBRATE_ERROR);
       speakJapanese(
         "カメラを起動できませんでした。カメラの使用を許可してから、もう一度ボタンを押してください。",
       );
@@ -250,7 +254,7 @@ export default function Home() {
     lastSpeechRef.current = { key: "start", at: Date.now() };
     updateStatus("running");
     setMessage("案内を開始しました。");
-    vibrate([100, 80, 100]);
+    vibrate(VIBRATE_START);
     speakJapanese("案内を開始します。止めるときは、画面をもう一度押してください。");
     frameTimerRef.current = setInterval(detectTick, FRAME_INTERVAL_MS);
     analyzeTimerRef.current = setInterval(analyze, ANALYZE_INTERVAL_MS);
@@ -263,7 +267,7 @@ export default function Home() {
     }
     stopGuide();
     setMessage("案内を停止しました。");
-    vibrate(300);
+    vibrate(VIBRATE_STOP);
     speakJapanese("案内を停止しました。");
   }, [startGuide, stopGuide]);
   const buttonLabel =
@@ -286,46 +290,37 @@ export default function Home() {
         : `${actionStyle[action] ?? "bg-zinc-800"} text-white`;
 
   return (
-    <div className="flex min-h-dvh flex-col bg-black text-white">
-      <main className="flex flex-1 flex-col gap-3 p-3">
-        <button
-          type="button"
-          onClick={onPress}
-          aria-label={`${buttonLabel}。${buttonHint}`}
-          className={`flex flex-1 flex-col items-center justify-center gap-6 rounded-3xl border-8 border-white px-4 py-10 font-bold shadow-2xl transition-colors focus:outline-none focus-visible:ring-8 focus-visible:ring-sky-400 active:scale-[0.99] ${buttonColor}`}
-        >
-          <span className="text-7xl leading-tight sm:text-9xl">
-            {buttonLabel}
-          </span>
-          <span className="text-2xl sm:text-4xl">{buttonHint}</span>
-        </button>
-
-        <p
-          aria-live="polite"
-          className="min-h-24 rounded-2xl bg-zinc-900 px-4 py-4 text-center text-3xl font-semibold leading-snug sm:text-4xl"
+    <main className="fixed inset-0 bg-black text-white">
+      <button
+        type="button"
+        onClick={onPress}
+        aria-label={`${buttonLabel}。${buttonHint}`}
+        className={`relative flex h-full w-full touch-manipulation select-none flex-col items-center justify-center gap-6 border-8 border-white px-4 py-10 font-bold transition-colors focus:outline-none focus-visible:border-sky-400 ${buttonColor}`}
+      >
+        <span className="text-7xl leading-tight sm:text-9xl">
+          {buttonLabel}
+        </span>
+        <span className="text-2xl sm:text-4xl">{buttonHint}</span>
+        <span
+          aria-hidden="true"
+          className="mt-4 max-w-3xl rounded-2xl bg-black/40 px-4 py-3 text-center text-2xl font-semibold leading-snug sm:text-4xl"
         >
           {message || "ボタンを押すと、カメラで信号を見て音声で案内します。"}
-        </p>
-
-        <div className="flex items-end justify-between gap-3" aria-hidden="true">
-          <video
-            ref={videoRef}
-            className={`h-24 w-40 rounded-xl bg-zinc-900 object-cover ${
-              status === "idle" ? "invisible" : ""
-            }`}
-            playsInline
-            muted
-          />
-          <Link
-            href="/test"
-            tabIndex={-1}
-            className="text-sm text-zinc-500 underline"
-          >
-            実験用ページ
-          </Link>
-        </div>
-        <canvas ref={canvasRef} className="hidden" />
-      </main>
-    </div>
+        </span>
+        <video
+          ref={videoRef}
+          aria-hidden="true"
+          className={`pointer-events-none absolute bottom-4 left-4 h-16 w-28 rounded-xl bg-zinc-900 object-cover ${
+            status === "idle" ? "invisible" : ""
+          }`}
+          playsInline
+          muted
+        />
+      </button>
+      <p aria-live="polite" className="sr-only">
+        {message}
+      </p>
+      <canvas ref={canvasRef} className="hidden" />
+    </main>
   );
 }
