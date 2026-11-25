@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   applyDeviceExposure,
-  calibrateExposure,
+  calibrateForScene,
   readExposureSupport,
 } from "@/lib/cameraExposure";
 import { combineSignalJudgement, measureLamps } from "@/lib/lampPosition";
@@ -226,15 +226,14 @@ export default function Home() {
       const track = stream.getVideoTracks()[0];
       const support = readExposureSupport(track);
       if (support.manualExposure) {
-        const result = await calibrateExposure({
+        const result = await calibrateForScene({
           track,
           support,
+          video,
           sampleFrame,
           isCancelled: () => statusRef.current !== "preparing",
         });
-        exposureRef.current = result.applied
-          ? { ...result.applied, mode: "calibrate" }
-          : null;
+        exposureRef.current = result.applied;
       } else {
         exposureRef.current = await applyDeviceExposure(track, support);
       }

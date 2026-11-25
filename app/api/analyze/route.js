@@ -44,6 +44,7 @@ const SYSTEM_PROMPT = `あなたは視覚障害者の道路横断を支援する
 - 歩行者信号が点滅している、または点滅の可能性がある場合は、これから横断を始めるべきではないため recommended_action を GO にしない。
 - タイムラインが無い場合は画像だけで判断し、1枚だけなら点滅は判定しない（unknown を優先）。
 - 「カメラ露光」が示されている場合、シャッタースピードを短くしているため画像全体が暗く、色が薄く写ることがある。暗さや色の薄さだけを理由に信号を消灯と判断しない。
+- 「夜間の撮影」が示されている場合、夜で周囲が暗く、ISO を上げているためノイズが多い。灯火は光がにじんで大きく写ることがある。車両はヘッドライトやテールライトの位置と大きさで接近を判断する。周囲が暗くて横断歩道や車両が判断できない場合は、見えないものを安全と判断せず WAIT または STOP にする。
 - pedestrian_countdown_meter_present は歩行者信号機に「あとどれくらいで信号が変わるか」を示す表示（数字カウントダウン、残り秒、プログレスバー、メーターなど）があるか。
 - pedestrian_countdown_seconds_estimate はメーターがあり数字が読める場合の、信号切り替えまでの残り秒数の目安（整数）。読めない場合は null。メーターが無い場合も null。
 - pedestrian_countdown_estimate はメーターはあるが秒数が読めない場合の、残り時間の粗い目安（短い=まもなく切り替わる、長い=まだ余裕）。メーターが無い、または全く推定できない場合は「不明」。秒数が読めた場合も、参考として短い/中程度/長いを付けてよい（0-10秒=短い、11-30秒=中程度、31秒以上=長い の目安）。
@@ -288,7 +289,11 @@ function buildUserText(images, timeline, exposure) {
   const lines = [
     `フレーム数: ${images.length}（古い順→新しい順）。道路横断の状況を分析してください。`,
   ];
-  if (exposure && exposure.mode !== "device") {
+  if (exposure?.scene === "night") {
+    lines.push(
+      `夜間の撮影: シャッタースピード ${formatShutter(exposure.shutter)}、ISO ${exposure.iso ?? "不明"}`,
+    );
+  } else if (exposure && exposure.mode !== "device") {
     lines.push(
       `カメラ露光: シャッタースピード ${formatShutter(exposure.shutter)}、ISO ${exposure.iso ?? "不明"}`,
     );
