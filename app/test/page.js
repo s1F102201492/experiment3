@@ -5,7 +5,9 @@ import {
   MANUAL_SHUTTERS,
   applyDeviceExposure,
   applyManualExposure,
-  calibrateExposure,
+  NIGHT_SCENE_LEVEL,
+  calibrateForScene,
+  exposureTimeToShutter,
   formatShutter,
   isFlickerSafe,
   isShutterSupported,
@@ -26,6 +28,15 @@ const JPEG_QUALITY = 0.65;
 const ANALYZE_INTERVAL_MS = 1000;
 const MIN_FRAMES_FOR_ANALYSIS = WINDOW_FRAMES / 2;
 const REPEAT_SPEECH_MS = 4000;
+const EXPOSURE_POLL_MS = 500;
+const EXPOSURE_HISTORY = 60;
+const MANUAL_VERIFY_DELAY_MS = 500;
+const MANUAL_TOLERANCE = 0.05;
+
+function isClose(actual, requested) {
+  if (!actual || !requested) return false;
+  return Math.abs(actual - requested) / requested <= MANUAL_TOLERANCE;
+}
 
 function speakJapanese(text) {
   if (!text || typeof window === "undefined" || !window.speechSynthesis) {
@@ -107,6 +118,11 @@ const judgeMethodLabel = {
   none: "検出なし",
 };
 
+const sceneLabel = {
+  day: "昼",
+  night: "夜",
+};
+
 const exposureModeLabel = {
   calibrate: "自動調整",
   manual: "手動",
@@ -144,6 +160,62 @@ function formatCountdown(result) {
     return `秒数不明（${coarse}）`;
   }
   return "メーターあり・残り不明";
+}
+
+const trackExposureModeLabel = {
+  manual: "手動",
+  continuous: "自動",
+  "single-shot": "単発自動",
+  none: "なし",
+};
+
+function ExposureChart({ label, values, format }) {
+  const present = values.filter((value) => value !== null);
+  const latest = values.at(-1) ?? null;
+  const min = present.length ? Math.min(...present) : null;
+  const max = present.length ? Math.max(...present) : null;
+  const span = max - min || 1;
+  const step = 100 / Math.max(1, EXPOSURE_HISTORY - 1);
+  const offset = EXPOSURE_HISTORY - values.length;
+  const points = values
+    .map((value, index) =>
+      value === null
+        ? null
+        : `${(offset + index) * step},${max === min ? 20 : 36 - ((value - min) / span) * 32}`,
+    )
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-baseline justify-between gap-2 text-sm">
+        <span className="text-zinc-500">{label}</span>
+        <span className="font-mono text-base font-semibold">
+          {latest === null ? "—" : format(latest)}
+        </span>
+      </div>
+      <svg
+        viewBox="0 0 100 40"
+        preserveAspectRatio="none"
+        className="h-14 w-full rounded-lg bg-zinc-100 dark:bg-zinc-900"
+      >
+        {points ? (
+          <polyline
+            points={points}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+            className="text-sky-600 dark:text-sky-400"
+          />
+        ) : null}
+      </svg>
+      <p className="text-xs text-zinc-500">
+        最小 {min === null ? "—" : format(min)} ／ 最大{" "}
+        {max === null ? "—" : format(max)}
+      </p>
+    </div>
+  );
 }
 
 function TimelineRow({ label, values }) {
@@ -198,6 +270,8 @@ export default function TestPage() {
   const [liveTimeline, setLiveTimeline] = useState(null);
   const [exposureSupport, setExposureSupport] = useState(null);
   const [exposureMode, setExposureMode] = useState("calibrate");
+  const [calibrationScene, setCalibrationScene] = useState("auto");
+  const [manualCheck, setManualCheck] = useState(null);
   const [manualShutter, setManualShutter] = useState(100);
   const [manualIso, setManualIso] = useState(null);
   const [appliedExposure, setAppliedExposure] = useState(null);
@@ -207,6 +281,8 @@ export default function TestPage() {
     message: "",
   });
   const { provider, providerRef, setProvider, available } = useLlmProvider();
+  const [exposureHistory, setExposureHistory] = useState([]);
+  const liveExposure = exposureHistory.at(-1) ?? null;
 
   const updateAppliedExposure = useCallback((value) => {
     appliedExposureRef.current = value;
@@ -217,8 +293,27 @@ export default function TestPage() {
     cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     cameraStreamRef.current = null;
     setExposureSupport(null);
+    setExposureHistory([]);
+    setManualCheck(null);
     updateAppliedExposure(null);
   }, [updateAppliedExposure]);
+
+  useEffect(() => {
+    if (!exposureSupport) return undefined;
+    const timer = setInterval(() => {
+      const settings = cameraStreamRef.current?.getVideoTracks()[0]?.getSettings();
+      if (!settings) return;
+      const sample = {
+        mode: settings.exposureMode ?? null,
+        shutter: exposureTimeToShutter(settings.exposureTime),
+        iso: settings.iso ?? null,
+      };
+      setExposureHistory((current) =>
+        [...current, sample].slice(-EXPOSURE_HISTORY),
+      );
+    }, EXPOSURE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [exposureSupport]);
 
   const stopLoop = useCallback(() => {
     runningRef.current = false;
@@ -445,7 +540,9 @@ export default function TestPage() {
     calibratingRef.current = true;
     setCalibration({ status: "running", steps: [], message: "" });
     try {
-      const result = await calibrateExposure({
+      const result = await calibrateForScene({
+        scene: calibrationScene,
+        video: videoRef.current,
         track,
         support,
         sampleFrame,
@@ -455,39 +552,72 @@ export default function TestPage() {
             steps: [...current.steps, step],
           })),
       });
-      if (result.applied) {
-        updateAppliedExposure({ ...result.applied, mode: "calibrate" });
-      }
-      const message = result.ok
-        ? `${formatShutter(result.applied.shutter)} で上下の灯火を判定できました。`
+      if (result.applied) updateAppliedExposure(result.applied);
+      const night = result.scene === "night";
+      const setting = `${formatShutter(result.applied?.shutter)}・ISO ${result.applied?.iso ?? "—"}`;
+      const outcome = result.ok
+        ? `${setting} で灯火を判定できました。`
         : result.reason === "no_signal"
-          ? "歩行者信号が映っていないため調整できませんでした。1/100秒に戻しました。"
-          : `どの設定でも判定が安定しませんでした。いちばん良かった ${formatShutter(result.applied?.shutter)} にしました。`;
+          ? night
+            ? "どの ISO でも歩行者信号を検出できませんでした。端末おまかせに戻しました。"
+            : "歩行者信号が映っていないため調整できませんでした。1/100秒に戻しました。"
+          : `どの設定でも判定が安定しませんでした。いちばん良かった ${setting} にしました。`;
+      const sceneText =
+        result.brightness === null
+          ? `${sceneLabel[result.scene]}用の調整（手動指定）`
+          : `明るさ ${result.brightness}（${NIGHT_SCENE_LEVEL} 未満で夜）→ ${sceneLabel[result.scene]}用の調整`;
       setCalibration((current) => ({
         ...current,
         status: result.ok ? "done" : "failed",
-        message,
+        message: `${sceneText}。${outcome}`,
       }));
       return result;
     } finally {
       calibratingRef.current = false;
     }
-  }, [ensureDetector, sampleFrame, updateAppliedExposure]);
+  }, [calibrationScene, ensureDetector, sampleFrame, updateAppliedExposure]);
 
   const applyExposureSettings = useCallback(
     async (mode) => {
       const track = cameraStreamRef.current?.getVideoTracks()[0];
       if (!track) throw new Error("先にカメラを起動してください。");
       const support = readExposureSupport(track);
+      if (mode !== "manual") setManualCheck(null);
       if (mode === "calibrate") {
         await runCalibration();
       } else if (mode === "manual") {
-        updateAppliedExposure(
-          await applyManualExposure(track, support, {
-            shutter: manualShutter,
-            iso: manualIso,
-          }),
-        );
+        const requested = {
+          shutter: manualShutter,
+          iso: support.iso ? manualIso : null,
+        };
+        setManualCheck({ status: "applying", requested });
+        try {
+          updateAppliedExposure(
+            await applyManualExposure(track, support, requested),
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, MANUAL_VERIFY_DELAY_MS),
+          );
+          const settings = track.getSettings();
+          const actual = {
+            mode: settings.exposureMode ?? null,
+            shutter: exposureTimeToShutter(settings.exposureTime),
+            iso: settings.iso ?? null,
+          };
+          const matched =
+            actual.mode === "manual" &&
+            isClose(actual.shutter, requested.shutter) &&
+            (requested.iso === null || isClose(actual.iso, requested.iso));
+          setManualCheck({
+            status: matched ? "applied" : "mismatch",
+            requested,
+            actual,
+            at: new Date().toLocaleTimeString("ja-JP"),
+          });
+        } catch (caught) {
+          setManualCheck({ status: "error", requested });
+          throw caught;
+        }
       } else {
         updateAppliedExposure(await applyDeviceExposure(track, support));
       }
@@ -587,6 +717,14 @@ export default function TestPage() {
   ]);
 
   const resultTimeline = lastResult?.signal_timeline;
+  const manualPending =
+    exposureMode === "manual" &&
+    Boolean(exposureSupport?.manualExposure) &&
+    (!manualCheck ||
+      manualCheck.requested.shutter !== manualShutter ||
+      (Boolean(exposureSupport.iso) && manualCheck.requested.iso !== manualIso));
+  const formatExposurePair = (value) =>
+    `${formatShutter(value?.shutter)}・ISO ${value?.iso ?? "—"}`;
 
   return (
     <div className="min-h-full bg-zinc-50 text-zinc-950 dark:bg-black dark:text-zinc-50">
@@ -606,15 +744,62 @@ export default function TestPage() {
         </header>
 
         <section className="grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
-          <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
-            <video
-              ref={videoRef}
-              className="aspect-video w-full bg-black object-contain"
-              playsInline
-              muted
-              controls={source === "video"}
-            />
-            <canvas ref={canvasRef} className="hidden" />
+          <div className="flex flex-col gap-4">
+            <div className="relative overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
+              <video
+                ref={videoRef}
+                className="aspect-video w-full bg-black object-contain"
+                playsInline
+                muted
+                controls={source === "video"}
+              />
+              {source === "camera" && liveExposure ? (
+                <div className="pointer-events-none absolute left-2 top-2 flex flex-wrap gap-2 font-mono text-white">
+                  <span
+                    className={`rounded-lg px-3 py-1.5 text-lg font-semibold ${
+                      liveExposure.shutter && !isFlickerSafe(liveExposure.shutter)
+                        ? "bg-amber-600/85"
+                        : "bg-black/70"
+                    }`}
+                  >
+                    SS {formatShutter(liveExposure.shutter)}
+                  </span>
+                  <span className="rounded-lg bg-black/70 px-3 py-1.5 text-lg font-semibold">
+                    ISO {liveExposure.iso ?? "—"}
+                  </span>
+                  <span className="self-center rounded-lg bg-black/70 px-2 py-1 text-xs">
+                    {trackExposureModeLabel[liveExposure.mode] ??
+                      liveExposure.mode ??
+                      "モード不明"}
+                  </span>
+                </div>
+              ) : null}
+              <canvas ref={canvasRef} className="hidden" />
+            </div>
+
+            {source === "camera" && exposureHistory.length > 0 ? (
+              <div className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
+                <h2 className="text-sm font-medium">
+                  カメラの実際の露光（直近
+                  {(EXPOSURE_HISTORY * EXPOSURE_POLL_MS) / 1000}秒）
+                </h2>
+                <div className="mt-2 grid gap-4 sm:grid-cols-2">
+                  <ExposureChart
+                    label="シャッタースピード（上ほど短い）"
+                    values={exposureHistory.map((sample) => sample.shutter)}
+                    format={formatShutter}
+                  />
+                  <ExposureChart
+                    label="ISO 感度"
+                    values={exposureHistory.map((sample) => sample.iso)}
+                    format={(iso) => `ISO ${iso}`}
+                  />
+                </div>
+                <p className="mt-2 text-xs text-zinc-500">
+                  {EXPOSURE_POLL_MS} ms ごとにカメラから読み取った値です。1/120秒より短いシャッターは橙色で表示します。
+                </p>
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-col gap-4 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
@@ -715,12 +900,39 @@ export default function TestPage() {
                     onChange={(event) => setExposureMode(event.target.value)}
                     disabled={running || calibration.status === "running"}
                   >
-                    <option value="calibrate">
-                      自動調整（ISO 最低、1/100秒から短くする）
-                    </option>
+                    <option value="calibrate">自動調整</option>
                     <option value="manual">手動</option>
                     <option value="device">端末おまかせ（自動露出）</option>
                   </select>
+                  {exposureMode === "calibrate" ? (
+                    <div className="flex flex-col gap-1">
+                      <div className="flex flex-wrap gap-2">
+                        {[
+                          ["auto", "昼夜を自動判定"],
+                          ["day", "昼"],
+                          ["night", "夜"],
+                        ].map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            aria-pressed={calibrationScene === value}
+                            disabled={running || calibration.status === "running"}
+                            className={`rounded-full px-3 py-1.5 text-xs disabled:opacity-50 ${
+                              calibrationScene === value
+                                ? "bg-zinc-950 text-white dark:bg-white dark:text-black"
+                                : "border border-zinc-300 dark:border-zinc-700"
+                            }`}
+                            onClick={() => setCalibrationScene(value)}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-xs text-zinc-500">
+                        昼: ISO 最低で 1/100秒から短くしてちらつきと白飛びを抑える。夜: 1/100秒のまま ISO を上げ、YOLO が信号を検出できる明るさを探す（見つからなければ 1/60・1/30秒も試す）。
+                      </p>
+                    </div>
+                  ) : null}
                   {exposureMode === "manual" ? (
                     <div className="flex flex-col gap-2">
                       <label className="flex items-center gap-2">
@@ -761,9 +973,14 @@ export default function TestPage() {
                   ) : null}
                   <button
                     type="button"
-                    className="self-start rounded-full border border-zinc-300 px-4 py-2 dark:border-zinc-700 disabled:opacity-50"
+                    className={`self-start rounded-full px-4 py-2 disabled:opacity-50 ${
+                      manualPending
+                        ? "bg-emerald-700 font-medium text-white"
+                        : "border border-zinc-300 dark:border-zinc-700"
+                    }`}
                     disabled={
                       calibration.status === "running" ||
+                      manualCheck?.status === "applying" ||
                       (running && exposureMode === "calibrate")
                     }
                     onClick={() =>
@@ -778,14 +995,49 @@ export default function TestPage() {
                   >
                     {calibration.status === "running"
                       ? "調整中…"
-                      : exposureMode === "calibrate"
-                        ? "今すぐ自動調整"
-                        : "設定を適用"}
+                      : manualCheck?.status === "applying"
+                        ? "適用中…"
+                        : exposureMode === "calibrate"
+                          ? "今すぐ自動調整"
+                          : "設定を適用"}
                   </button>
+                  {exposureMode === "manual" ? (
+                    <div aria-live="polite" className="text-xs">
+                      {manualCheck?.status === "applying" ? (
+                        <p className="text-zinc-500">カメラに設定しています…</p>
+                      ) : manualPending ? (
+                        <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                          {manualCheck
+                            ? `まだ適用されていない変更があります（${formatExposurePair({ shutter: manualShutter, iso: exposureSupport.iso ? manualIso : null })}）。「設定を適用」を押してください。`
+                            : "まだ適用していません。値を選んで「設定を適用」を押してください。"}
+                        </p>
+                      ) : manualCheck?.status === "applied" ? (
+                        <p className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-200">
+                          ✓ 適用されました（{manualCheck.at}）
+                          <br />
+                          カメラの実際の値: {formatExposurePair(manualCheck.actual)}
+                        </p>
+                      ) : manualCheck?.status === "mismatch" ? (
+                        <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                          ⚠ 要求どおりになっていません（{manualCheck.at}）
+                          <br />
+                          要求: {formatExposurePair(manualCheck.requested)} ／ 実際:{" "}
+                          {formatExposurePair(manualCheck.actual)}
+                          {manualCheck.actual.mode !== "manual"
+                            ? `（カメラの露出モードが「${trackExposureModeLabel[manualCheck.actual.mode] ?? manualCheck.actual.mode ?? "不明"}」のままです）`
+                            : ""}
+                        </p>
+                      ) : manualCheck?.status === "error" ? (
+                        <p className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
+                          適用に失敗しました（{formatExposurePair(manualCheck.requested)}）。
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <p className="text-zinc-600 dark:text-zinc-400">
                     現在:{" "}
                     {appliedExposure
-                      ? `${exposureModeLabel[appliedExposure.mode]} ／ ${formatShutter(appliedExposure.shutter)} ／ ISO ${appliedExposure.iso ?? "—"}`
+                      ? `${exposureModeLabel[appliedExposure.mode]}${appliedExposure.scene ? `（${sceneLabel[appliedExposure.scene]}）` : ""} ／ ${formatShutter(appliedExposure.shutter)} ／ ISO ${appliedExposure.iso ?? "—"}`
                       : "未設定"}
                   </p>
                   {appliedExposure?.shutter &&
@@ -804,6 +1056,7 @@ export default function TestPage() {
                       <thead>
                         <tr className="text-left text-zinc-500">
                           <th className="pr-2">シャッター</th>
+                          <th className="pr-2">ISO</th>
                           <th className="pr-2">検出</th>
                           <th className="pr-2">判定可/点灯</th>
                           <th className="pr-2">明暗比</th>
@@ -811,9 +1064,10 @@ export default function TestPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {calibration.steps.map((step) => (
-                          <tr key={step.shutter}>
+                        {calibration.steps.map((step, index) => (
+                          <tr key={index}>
                             <td className="pr-2">{formatShutter(step.shutter)}</td>
+                            <td className="pr-2">{step.iso ?? "—"}</td>
                             <td className="pr-2">{step.found}</td>
                             <td className="pr-2">
                               {step.judgeable}/{step.lit}
@@ -1032,7 +1286,7 @@ export default function TestPage() {
                       <td className="py-2 pr-3">{log.latency_ms}</td>
                       <td className="py-2 pr-3 whitespace-nowrap">
                         {log.camera_exposure
-                          ? `${formatShutter(log.camera_exposure.shutter)} / ISO ${log.camera_exposure.iso ?? "—"}`
+                          ? `${log.camera_exposure.scene ? `${sceneLabel[log.camera_exposure.scene]} ` : ""}${formatShutter(log.camera_exposure.shutter)} / ISO ${log.camera_exposure.iso ?? "—"}`
                           : "—"}
                       </td>
                       <td className="py-2 pr-3">
