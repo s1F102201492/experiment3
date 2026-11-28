@@ -30,14 +30,6 @@ const MIN_FRAMES_FOR_ANALYSIS = WINDOW_FRAMES / 2;
 const REPEAT_SPEECH_MS = 4000;
 const EXPOSURE_POLL_MS = 500;
 const EXPOSURE_HISTORY = 60;
-const MANUAL_VERIFY_DELAY_MS = 500;
-const MANUAL_TOLERANCE = 0.05;
-
-function isClose(actual, requested) {
-  if (!actual || !requested) return false;
-  return Math.abs(actual - requested) / requested <= MANUAL_TOLERANCE;
-}
-
 function speakJapanese(text) {
   if (!text || typeof window === "undefined" || !window.speechSynthesis) {
     return;
@@ -566,10 +558,15 @@ export default function TestPage() {
         result.brightness === null
           ? `${sceneLabel[result.scene]}用の調整（手動指定）`
           : `明るさ ${result.brightness}（${NIGHT_SCENE_LEVEL} 未満で夜）→ ${sceneLabel[result.scene]}用の調整`;
+      const unapplied = result.steps.filter((step) => !step.matched).length;
+      const applyWarning =
+        unapplied > 0
+          ? ` ⚠ ${result.steps.length}段階中 ${unapplied}段階で露光の設定がカメラに反映されていません。この調整結果は当てになりません。`
+          : "";
       setCalibration((current) => ({
         ...current,
-        status: result.ok ? "done" : "failed",
-        message: `${sceneText}。${outcome}`,
+        status: result.ok && unapplied === 0 ? "done" : "failed",
+        message: `${sceneText}。${outcome}${applyWarning}`,
       }));
       return result;
     } finally {
@@ -592,26 +589,14 @@ export default function TestPage() {
         };
         setManualCheck({ status: "applying", requested });
         try {
-          updateAppliedExposure(
-            await applyManualExposure(track, support, requested),
-          );
-          await new Promise((resolve) =>
-            setTimeout(resolve, MANUAL_VERIFY_DELAY_MS),
-          );
-          const settings = track.getSettings();
-          const actual = {
-            mode: settings.exposureMode ?? null,
-            shutter: exposureTimeToShutter(settings.exposureTime),
-            iso: settings.iso ?? null,
-          };
-          const matched =
-            actual.mode === "manual" &&
-            isClose(actual.shutter, requested.shutter) &&
-            (requested.iso === null || isClose(actual.iso, requested.iso));
+          const applied = await applyManualExposure(track, support, requested);
+          updateAppliedExposure(applied);
           setManualCheck({
-            status: matched ? "applied" : "mismatch",
+            status: applied.matched ? "applied" : "mismatch",
             requested,
-            actual,
+            sent: applied.requested,
+            actual: applied.actual,
+            errors: applied.errors,
             at: new Date().toLocaleTimeString("ja-JP"),
           });
         } catch (caught) {
@@ -894,6 +879,15 @@ export default function TestPage() {
                       ? ` ／ ISO ${exposureSupport.iso.min}〜${exposureSupport.iso.max}`
                       : " ／ ISO 設定なし"}
                   </p>
+                  <p className="font-mono text-xs text-zinc-500">
+                    exposureTime {exposureSupport.exposureTime.min}〜
+                    {exposureSupport.exposureTime.max}（刻み{" "}
+                    {exposureSupport.exposureTime.step ?? "—"}）
+                    {exposureSupport.iso
+                      ? ` ／ ISO 刻み ${exposureSupport.iso.step ?? "—"}`
+                      : ""}{" "}
+                    ／ exposureMode {exposureSupport.exposureModes.join(", ")}
+                  </p>
                   <select
                     className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 dark:border-zinc-700"
                     value={exposureMode}
@@ -1026,6 +1020,25 @@ export default function TestPage() {
                           {manualCheck.actual.mode !== "manual"
                             ? `（カメラの露出モードが「${trackExposureModeLabel[manualCheck.actual.mode] ?? manualCheck.actual.mode ?? "不明"}」のままです）`
                             : ""}
+                          <br />
+                          <span className="font-mono">
+                            送った値: exposureTime {manualCheck.sent.exposureTime} ／ ISO{" "}
+                            {manualCheck.sent.iso ?? "—"} → カメラの値: exposureMode{" "}
+                            {manualCheck.actual.mode ?? "—"} ／ exposureTime{" "}
+                            {manualCheck.actual.exposureTime ?? "—"} ／ ISO{" "}
+                            {manualCheck.actual.iso ?? "—"}
+                          </span>
+                          {manualCheck.errors.length > 0 ? (
+                            <>
+                              <br />
+                              エラー: {manualCheck.errors.join(" ／ ")}
+                            </>
+                          ) : (
+                            <>
+                              <br />
+                              エラーは返っていません（カメラが設定を黙って無視しています）。
+                            </>
+                          )}
                         </p>
                       ) : manualCheck?.status === "error" ? (
                         <p className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
@@ -1055,8 +1068,9 @@ export default function TestPage() {
                     <table className="text-xs">
                       <thead>
                         <tr className="text-left text-zinc-500">
-                          <th className="pr-2">シャッター</th>
-                          <th className="pr-2">ISO</th>
+                          <th className="pr-2">要求</th>
+                          <th className="pr-2">実際</th>
+                          <th className="pr-2">反映</th>
                           <th className="pr-2">検出</th>
                           <th className="pr-2">判定可/点灯</th>
                           <th className="pr-2">明暗比</th>
@@ -1066,8 +1080,21 @@ export default function TestPage() {
                       <tbody>
                         {calibration.steps.map((step, index) => (
                           <tr key={index}>
-                            <td className="pr-2">{formatShutter(step.shutter)}</td>
-                            <td className="pr-2">{step.iso ?? "—"}</td>
+                            <td className="pr-2 whitespace-nowrap">
+                              {formatExposurePair(step.target)}
+                            </td>
+                            <td className="pr-2 whitespace-nowrap">
+                              {formatExposurePair(step)}
+                            </td>
+                            <td
+                              className={`pr-2 ${
+                                step.matched
+                                  ? "text-emerald-700 dark:text-emerald-400"
+                                  : "text-amber-700 dark:text-amber-400"
+                              }`}
+                            >
+                              {step.matched ? "✓" : "⚠"}
+                            </td>
                             <td className="pr-2">{step.found}</td>
                             <td className="pr-2">
                               {step.judgeable}/{step.lit}
